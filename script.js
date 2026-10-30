@@ -269,12 +269,49 @@ hardQuestions.push(...[{"q": "AND 게이트에서 A=0, B=0일 때 Y는?", "choic
 const EXAM_COUNT = 10;
 const SCORE_PER_Q = 10;
 const RANK_STORAGE_KEY = 'logicLabExamRecords_v5';
+const ROOM_STORAGE_KEY = 'logicLabExamRoom_v5';
+const NTFY_BASE = 'https://ntfy.sh';
 
 let examRecords = [];
-try {
-  const saved = JSON.parse(localStorage.getItem(RANK_STORAGE_KEY));
-  if (Array.isArray(saved)) examRecords = saved;
-} catch (e) {}
+let clearedBeforeTs = 0;
+let liveEventSource = null;
+
+function getDefaultRoomCode() {
+  try {
+    const params = new URLSearchParams(location.search);
+    if (params.get('room')) return params.get('room').trim();
+    const savedRoom = localStorage.getItem(ROOM_STORAGE_KEY);
+    if (savedRoom && savedRoom.trim()) return savedRoom.trim();
+  } catch (e) {}
+  return 'LOGIC-CLASS-1';
+}
+
+let currentRoomCode = getDefaultRoomCode();
+
+function getTopicName(roomCode) {
+  const clean = String(roomCode || 'LOGIC-CLASS-1')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, '-');
+  const hostSlug = (location.hostname || 'github-pages')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '')
+    .slice(0, 18) || 'local';
+  return `logiclab-v5-${hostSlug}-${clean || 'default'}`;
+}
+
+function getLocalStorageKey() {
+  return `${RANK_STORAGE_KEY}_${currentRoomCode}`;
+}
+
+function loadLocalRecords() {
+  examRecords = [];
+  try {
+    const saved = JSON.parse(localStorage.getItem(getLocalStorageKey()));
+    if (Array.isArray(saved)) examRecords = saved;
+  } catch (e) {}
+}
+loadLocalRecords();
 
 let examState = {
   active: false,
@@ -288,7 +325,109 @@ let examState = {
 
 function saveExamRecords() {
   try {
-    localStorage.setItem(RANK_STORAGE_KEY, JSON.stringify(examRecords));
+    localStorage.setItem(getLocalStorageKey(), JSON.stringify(examRecords));
+  } catch (e) {}
+}
+
+function setSyncStatus(state, text) {
+  const dot = document.getElementById('syncStatusDot');
+  const label = document.getElementById('syncStatusText');
+  if (dot) {
+    dot.className = 'sync-dot ' + (state === 'online' ? 'online' : state === 'syncing' ? 'syncing' : '');
+  }
+  if (label && text) {
+    label.textContent = text;
+  }
+}
+
+function applyCloudEvents(lines) {
+  let recordsMap = new Map();
+  // 기존 로컬 기록도 유지하되 클라우드 초기화 시각 이후의 데이터만 병합
+  examRecords.forEach(r => {
+    if (r && r.id) recordsMap.set(String(r.id), r);
+  });
+
+  lines.forEach(line => {
+    if (!line || !line.trim()) return;
+    try {
+      const env = JSON.parse(line);
+      if (env.event !== 'message' || !env.message) return;
+      const payload = JSON.parse(env.message);
+      if (payload.type === 'clear' && payload.clearedAt) {
+        clearedBeforeTs = Math.max(clearedBeforeTs, Number(payload.clearedAt));
+        for (const [k, rec] of recordsMap.entries()) {
+          if (Number(rec.id) <= clearedBeforeTs) {
+            recordsMap.delete(k);
+          }
+        }
+      } else if (payload.type === 'record' && payload.record && payload.record.id) {
+        const rec = payload.record;
+        if (Number(rec.id) > clearedBeforeTs) {
+          recordsMap.set(String(rec.id), rec);
+        }
+      }
+    } catch (e) {}
+  });
+
+  examRecords = Array.from(recordsMap.values())
+    .filter(r => Number(r.id) > clearedBeforeTs)
+    .sort((a, b) => Number(a.id) - Number(b.id));
+
+  saveExamRecords();
+  renderRankingAndWrongNotes();
+}
+
+async function fetchSharedRecords() {
+  const topic = getTopicName(currentRoomCode);
+  setSyncStatus('syncing', '다른 기기 기록 불러오는 중...');
+  try {
+    const res = await fetch(`https://ntfy.sh/${topic}/json?poll=1&since=all`, {
+      method: 'GET',
+      cache: 'no-store'
+    });
+    if (res.ok) {
+      const text = await res.text();
+      const lines = text.split('\n');
+      applyCloudEvents(lines);
+      setSyncStatus('online', `전체 기기 실시간 공유 중 (${currentRoomCode})`);
+    } else {
+      setSyncStatus('online', `기기 공유 대기 중 (${currentRoomCode})`);
+    }
+  } catch (e) {
+    setSyncStatus('offline', '오프라인/내 기기 저장 모드');
+  }
+}
+
+async function publishCloudEvent(payload) {
+  const topic = getTopicName(currentRoomCode);
+  try {
+    await fetch(`https://ntfy.sh/${topic}`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+    setSyncStatus('online', `전체 기기 실시간 공유 중 (${currentRoomCode})`);
+  } catch (e) {
+    setSyncStatus('offline', '내 기기에 저장됨 (네트워크 확인)');
+  }
+}
+
+function connectLiveStream() {
+  if (liveEventSource) {
+    try { liveEventSource.close(); } catch (e) {}
+    liveEventSource = null;
+  }
+  if (typeof EventSource === 'undefined') return;
+  const topic = getTopicName(currentRoomCode);
+  try {
+    liveEventSource = new EventSource(`https://ntfy.sh/${topic}/sse`);
+    liveEventSource.onmessage = (ev) => {
+      if (ev && ev.data) {
+        applyCloudEvents([ev.data]);
+      }
+    };
+    liveEventSource.onopen = () => {
+      setSyncStatus('online', `전체 기기 실시간 공유 중 (${currentRoomCode})`);
+    };
   } catch (e) {}
 }
 
@@ -510,6 +649,7 @@ function submitMockExam() {
 
   examRecords.push(record);
   saveExamRecords();
+  publishCloudEvent({ type: 'record', record });
 
   const banner = document.getElementById('examResultBanner');
   if (banner) {
@@ -698,21 +838,63 @@ if (submitExamBtn) submitExamBtn.addEventListener('click', submitMockExam);
 const clearWrong = document.getElementById('clearWrongNotes');
 if (clearWrong) {
   clearWrong.addEventListener('click', () => {
+    const nowTs = Date.now();
+    clearedBeforeTs = nowTs;
     examRecords = [];
     selectedRecordId = null;
     saveExamRecords();
+    publishCloudEvent({ type: 'clear', clearedAt: nowTs });
     const banner = document.getElementById('examResultBanner');
     if (banner) banner.hidden = true;
     renderRankingAndWrongNotes();
   });
 }
 
+const roomInput = document.getElementById('examRoomCode');
+if (roomInput) {
+  roomInput.value = currentRoomCode;
+  const changeRoom = () => {
+    const val = roomInput.value.trim() || 'LOGIC-CLASS-1';
+    currentRoomCode = val;
+    roomInput.value = val;
+    try { localStorage.setItem(ROOM_STORAGE_KEY, val); } catch (e) {}
+    clearedBeforeTs = 0;
+    selectedRecordId = null;
+    loadLocalRecords();
+    renderRankingAndWrongNotes();
+    fetchSharedRecords();
+    connectLiveStream();
+  };
+  roomInput.addEventListener('change', changeRoom);
+  roomInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      changeRoom();
+    }
+  });
+}
+
+const syncRoomBtn = document.getElementById('syncRoomBtn');
+if (syncRoomBtn) {
+  syncRoomBtn.addEventListener('click', () => {
+    if (roomInput && roomInput.value.trim()) {
+      currentRoomCode = roomInput.value.trim();
+      try { localStorage.setItem(ROOM_STORAGE_KEY, currentRoomCode); } catch (e) {}
+    }
+    fetchSharedRecords();
+    connectLiveStream();
+  });
+}
+
 renderRankingAndWrongNotes();
+fetchSharedRecords();
+connectLiveStream();
 
 // 단계별 페이지 전환: 상단바 클릭 시 해당 단계만 표시
 function showPage(page){
   document.querySelectorAll('.page-section').forEach(sec=>sec.classList.toggle('active-page', sec.dataset.pageSection===page));
   document.querySelectorAll('.nav-link').forEach(a=>a.classList.toggle('active', a.dataset.page===page));
+  if (page === 'step6') fetchSharedRecords();
   window.scrollTo({top:0, behavior:'smooth'});
 }
 document.querySelectorAll('.nav-link').forEach(a=>a.addEventListener('click',e=>{e.preventDefault();showPage(a.dataset.page);}));
